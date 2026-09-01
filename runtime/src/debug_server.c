@@ -2896,6 +2896,9 @@ static void handle_dirty_ram_stats(int id, const char *json)
     extern uint64_t g_dirty_ram_aborts;
     extern uint64_t g_dirty_ram_guard_yields;
     extern uint64_t g_dirty_ram_native_handoffs;
+    extern uint64_t g_hle_intrp_walk_seen, g_hle_intrp_walk_runs,
+                    g_hle_intrp_walk_calls, g_hle_intrp_walk_bails;
+    extern char g_hle_env_dbg;
     extern uint32_t dirty_ram_get_bitmap(void);
     extern uint32_t dirty_ram_get_bitmap_word(uint32_t word_index);
     extern uint32_t dirty_ram_get_bitmap_word_count(void);
@@ -2910,6 +2913,9 @@ static void handle_dirty_ram_stats(int id, const char *json)
              "{\"id\":%d,\"ok\":true,\"blocks_run\":%llu,"
              "\"insns_run\":%llu,\"aborts\":%llu,"
              "\"guard_yields\":%llu,\"native_handoffs\":%llu,"
+             "\"hle_intrp_walk_seen\":%llu,\"hle_env_dbg\":\"%c\","
+             "\"hle_intrp_walk_runs\":%llu,\"hle_intrp_walk_calls\":%llu,"
+             "\"hle_intrp_walk_bails\":%llu,"
              "\"dirty_bitmap\":\"0x%08X\",\"per_pc\":[",
              id,
              (unsigned long long)g_dirty_ram_blocks_run,
@@ -2917,6 +2923,11 @@ static void handle_dirty_ram_stats(int id, const char *json)
              (unsigned long long)g_dirty_ram_aborts,
              (unsigned long long)g_dirty_ram_guard_yields,
              (unsigned long long)g_dirty_ram_native_handoffs,
+             (unsigned long long)g_hle_intrp_walk_seen,
+             g_hle_env_dbg,
+             (unsigned long long)g_hle_intrp_walk_runs,
+             (unsigned long long)g_hle_intrp_walk_calls,
+             (unsigned long long)g_hle_intrp_walk_bails,
              (unsigned)dirty_ram_get_bitmap());
 
     int first = 1;

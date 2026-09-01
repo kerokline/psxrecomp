@@ -2334,6 +2334,9 @@ static int exec_one_fetched_inner(CPUState *cpu, uint32_t pc, uint32_t insn,
 }
 
 static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_addr);
+/* HLE IntRP walk hook (defined below, before dirty_ram_dispatch_inner); also
+ * called from psx_run_precise, which sits above that definition. */
+static int hle_intrp_walk_try(CPUState *cpu, uint32_t pc, uint32_t insn);
 
 /* Public entry point.  Caller (psx_dispatch) has translated `addr` to a
  * KSEG-stripped form already in some cases, so accept any address and
@@ -2579,6 +2582,13 @@ static void psx_run_precise(CPUState *cpu, uint32_t bcyc, int deadline_entry) {
             continue;
         }
 
+        /* HLE IntRP walk: the BIOS exception handler runs through this precise
+         * slice; intercept the hot 4-queue walk here too (see the block above
+         * dirty_ram_dispatch_inner). */
+        if (hle_intrp_walk_try(cpu, pc, fetch_word(pc & 0x1FFFFFFFu))) {
+            pc = cpu->pc;
+            continue;
+        }
         uint32_t next_pc = 0;
         g_unsupported_seen = 0;
         cosim_exec_one_begin();
@@ -2728,6 +2738,145 @@ int psx_slice_block_impl(CPUState *cpu, uint32_t block_addr, uint32_t bcyc, int 
     cpu->pc = block_addr;
     psx_run_precise(cpu, bcyc, has_deadline);
     return 1;
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+ * HLE: native BIOS interrupt-dispatch (IntRP) walk   [prototype, opt-in]
+ *
+ * The BIOS general exception handler's "invoke 4 interrupt callback queues"
+ * loop (docs/psx_bios_disasm.txt:1273; OpenBIOS relocates it into RAM, loop
+ * top ~0x2914) runs on EVERY interrupt. Being boot-relocated dirty kernel RAM
+ * it has no native dispatch entry, so it is interpreted — measured at ~89 % of
+ * wall time and ~0.47x realtime during BoF3's Capcom FMV
+ * (docs/vblank-pacing-bug.md). This replaces the hot 4-queue walk with a native
+ * walk that performs the SAME guest memory reads and func1()/func2() calls,
+ * then resumes interpreting at the post-walk register-restore (loop_top+0x5C).
+ * The interpreted save / restore / ReturnFromException are UNTOUCHED, and
+ * psx_check_interrupts snapshots+restores cpu->gpr around the whole handler, so
+ * the exception-context contract is unaffected.
+ *
+ * Prototype for docs/vblank-pacing-bug.md Option B — enable with
+ * PSX_HLE_INTRP_WALK=1 (default OFF) to A/B the win before hardening.
+ * ──────────────────────────────────────────────────────────────────────── */
+extern int g_psx_call_bail;
+uint64_t g_hle_intrp_walk_seen  = 0;   /* walk signature matched (flag-independent) */
+uint64_t g_hle_intrp_walk_runs  = 0;   /* handler invocations HLE'd            */
+uint64_t g_hle_intrp_walk_calls = 0;   /* func1/func2 guest calls made         */
+uint64_t g_hle_intrp_walk_bails = 0;   /* calls that hit the stack-watermark   */
+
+static int hle_intrp_walk_enabled(void);
+static int hle_intrp_walk_match(CPUState *cpu, uint32_t pc);
+static uint32_t hle_intrp_walk_run(CPUState *cpu, uint32_t loop_top);
+
+/* Shared hook body: if the fetched insn/pc is the IntRP walk loop top, count it
+ * and (when enabled) run it natively, leaving cpu->pc at the interpreted restore.
+ * Returns 1 if the walk was HLE'd (caller should resume at cpu->pc). */
+static int hle_intrp_walk_try(CPUState *cpu, uint32_t pc, uint32_t insn) {
+    if (insn != 0x8E760000u || !hle_intrp_walk_match(cpu, pc))
+        return 0;
+    g_hle_intrp_walk_seen++;
+    if (!hle_intrp_walk_enabled())
+        return 0;
+    cpu->pc = hle_intrp_walk_run(cpu, pc);
+    return 1;
+}
+
+char g_hle_env_dbg = '?';   /* diagnostic: getenv first char ('N'=null) */
+static int hle_intrp_walk_enabled(void) {
+    static int en = -1;
+    if (en < 0) {
+        const char *e = getenv("PSX_HLE_INTRP_WALK");
+        g_hle_env_dbg = e ? (e[0] ? e[0] : 'E') : 'N';
+        en = (e && e[0] == '1') ? 1 : 0;
+    }
+    return en;
+}
+
+/* pc is at the walk loop top (its first word is `lw s6,0(s3)` = 0x8E760000,
+ * already matched by the caller). Confirm the rest of the exact IntRP-walk
+ * signature so this only ever fires on that one loop. */
+static int hle_intrp_walk_match(CPUState *cpu, uint32_t pc) {
+    return cpu->read_word(pc + 0x10) == 0x8ED10008u &&  /* lw   s1,8(s6)  */
+           cpu->read_word(pc + 0x14) == 0x8ED00004u &&  /* lw   s0,4(s6)  */
+           cpu->read_word(pc + 0x20) == 0x0220F809u &&  /* jalr ra,s1     */
+           cpu->read_word(pc + 0x38) == 0x0200F809u &&  /* jalr ra,s0     */
+           cpu->read_word(pc + 0x40) == 0x8ED60000u &&  /* lw   s6,0(s6)  */
+           cpu->read_word(pc + 0x50) == 0x22730008u &&  /* addi s3,s3,8   */
+           cpu->read_word(pc + 0x54) == 0x1693FFEAu;    /* bne  s4,s3,top */
+}
+
+/* Call a guest verifier/handler, mirroring the dirty interp's non-local call
+ * contract (phase tag + stack-watermark bail handling). Result lands in v0. */
+static void hle_call_guest(CPUState *cpu, uint32_t target, uint32_t ret_pc) {
+    /* Run the callback as a NORMAL nested dispatch, not inside the precise
+     * slice: in precise mode the callee's `jr ra` surfaces instead of returning
+     * to the dispatch frame, so psx_dispatch_call never completes (hang). */
+    extern int g_precise_mode;
+    int prev_phase   = g_exec_phase;
+    int prev_precise = g_precise_mode;
+    int prev_interp  = g_dirty_interp_active;
+    g_precise_mode        = 0;
+    g_dirty_interp_active = 0;
+    g_exec_phase          = 3;        /* dirty/native callees re-tag inside */
+    cpu->gpr[31] = ret_pc;            /* ra: the guest jalr sets this; the callee's
+                                       * `jr ra` returns here (mirrors return_addr) */
+    cpu->pc = 0;
+    psx_dispatch_call(cpu, target, ret_pc);
+    g_exec_phase          = prev_phase;
+    g_dirty_interp_active = prev_interp;
+    g_precise_mode        = prev_precise;
+    g_hle_intrp_walk_calls++;
+    if (g_psx_call_bail) {            /* watermark bail: clear and continue  */
+        g_hle_intrp_walk_bails++;
+        g_psx_call_bail = 0;
+    }
+    cpu->pc = 0;
+}
+
+/* Native equivalent of the 4-queue IntRP walk. Enters with s3/s4 already set up
+ * by the interpreted prologue (s3 = Head, s4 = Head + 32). For each queue head
+ * it walks the IntRP node list {next@+0, func2@+4, func1@+8}: call func1(); if
+ * it returns nonzero and func2 exists, call func2(result). Returns the PC to
+ * resume interpreting at (the register-restore following the loop). */
+static uint32_t hle_intrp_walk_run(CPUState *cpu, uint32_t loop_top) {
+    uint32_t s3 = cpu->gpr[19];              /* Head cursor */
+    uint32_t s4 = cpu->gpr[20];              /* Head + 32 (4 queues * 8 bytes) */
+    const uint32_t ret1 = loop_top + 0x28;   /* 0x293C: after the func1 jalr   */
+    const uint32_t ret2 = loop_top + 0x40;   /* 0x2954: after the func2 jalr   */
+    uint32_t guest_insns = 0;                /* loop-control cycle approximation */
+    /* PSX_HLE_INTRP_WALK=2 => traverse only (no func1/func2 calls) — diagnostic
+     * to separate a bad-pointer loop from call re-entrancy. */
+    static int s_call = -1;
+    if (s_call < 0) { const char *e = getenv("PSX_HLE_INTRP_WALK"); s_call = (e && e[0]=='2') ? 0 : 1; }
+    int qguard = 0;
+    for (; s3 != s4 && qguard < 8; s3 += 8, qguard++) {
+        uint32_t entry = cpu->read_word(s3);         /* Head[n].head */
+        guest_insns += 3;
+        int nguard = 0;
+        while (entry && nguard++ < 256) {
+            uint32_t f1 = cpu->read_word(entry + 8); /* verifier (loaded first) */
+            uint32_t f2 = cpu->read_word(entry + 4); /* handler  */
+            guest_insns += 4;
+            if (f1 && s_call) {
+                hle_call_guest(cpu, f1, ret1);       /* v0 = f1() */
+                uint32_t v0 = cpu->gpr[2];
+                guest_insns += 4;
+                if (v0 && f2) {
+                    cpu->gpr[4] = v0;                /* a0 = v0 */
+                    hle_call_guest(cpu, f2, ret2);   /* f2(v0) */
+                    guest_insns += 3;
+                }
+            }
+            entry = cpu->read_word(entry);           /* node->next (re-read) */
+            guest_insns += 3;
+        }
+        guest_insns += 2;
+    }
+    cpu->gpr[19] = s4;   /* s3 == s4: outer loop terminated */
+    cpu->gpr[22] = 0;    /* s6 == 0: inner loop terminated */
+    psx_advance_cycles(guest_insns);   /* funcs self-charge inside dispatch */
+    g_hle_intrp_walk_runs++;
+    return loop_top + 0x5C;   /* 0x2970: interpreted restore + RFE */
 }
 
 static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
@@ -2989,6 +3138,16 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
         { extern void cosim_block(uint32_t); cosim_block(pc); }
 #endif
         uint32_t insn = fetch_word(pc & 0x1FFFFFFFu);
+        /* HLE IntRP walk (prototype, PSX_HLE_INTRP_WALK=1): when about to
+         * interpret the BIOS exception handler's hot 4-queue walk, run it
+         * natively and resume at the interpreted restore. The cheap opcode
+         * pre-check (`lw s6,0(s3)`) keeps this near-free on every other insn.
+         * See the block above dirty_ram_dispatch_inner. */
+        if (hle_intrp_walk_try(cpu, pc, insn)) {
+            pc = cpu->pc;
+            insns_executed++;
+            continue;
+        }
 #ifndef PSX_NO_DEBUG_TOOLS
         uint32_t before_s0 = cpu->gpr[16];
         uint32_t before_ra = cpu->gpr[31];
